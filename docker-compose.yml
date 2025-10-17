@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://event_user:secure_password_123@db:5432/events_db
+      - NATS_URL=nats://nats:4222
+    depends_on:
+      - db
+      - nats
+    volumes:
+      - ./logs:/app/logs
+    # Приложение само обрабатывает реконнекты
+    command: "uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+  db:
+    image: postgres:13
+    environment:
+      - POSTGRES_DB=events_db
+      - POSTGRES_USER=event_user
+      - POSTGRES_PASSWORD=secure_password_123
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    # Упрощенный healthcheck
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U event_user -d events_db || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  nats:
+    image: nats:2.9-alpine
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    command: "-js -m 8222"
+    # Упрощенный healthcheck
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 1 nc -z localhost 4222 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    build: .
+    environment:
+      - DATABASE_URL=postgresql://event_user:secure_password_123@db:5432/events_db
+      - NATS_URL=nats://nats:4222
+    depends_on:
+      - db
+      - nats
+    volumes:
+      - ./logs:/app/logs
+    # Воркер сам обрабатывает реконнекты
+    command: "python -m app.worker"
+
+volumes:
+  postgres_data:
