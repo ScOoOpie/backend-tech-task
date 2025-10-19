@@ -19,7 +19,7 @@ import uuid
 from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 import os
 # Моделі БД
-#Base.metadata.create_all(bind=engine)
+Base.metadata.create_all(bind=engine)
 
 # Налаштування логування
 def setup_logging():
