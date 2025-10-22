@@ -21,7 +21,7 @@ from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 import os
 from .migrate import run_migrations
 # Моделі БД
-# Base.metadata.create_all(bind=engine)
+Base.metadata.create_all(bind=engine)
 
 # Налаштування логування
 def setup_logging():
