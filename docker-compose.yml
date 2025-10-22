@@ -8,12 +8,13 @@ services:
     environment:
       - DATABASE_URL=postgresql://event_user:secure_password_123@db:5432/events_db
       - NATS_URL=nats://nats:4222
+      - REDIS_URL=redis://:secure_redis_password_123@redis:6379 
     depends_on:
       - db
       - nats
+      - redis  
     volumes:
       - ./logs:/app/logs
-    # Приложение само обрабатывает реконнекты
     command: "uvicorn app.main:app --host 0.0.0.0 --port 8000"
 
   db:
@@ -26,7 +27,6 @@ services:
       - postgres_data:/var/lib/postgresql/data
     ports:
       - "5433:5432"
-    # Упрощенный healthcheck
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U event_user -d events_db || exit 1"]
       interval: 5s
@@ -39,25 +39,41 @@ services:
       - "4222:4222"
       - "8222:8222"
     command: "-js -m 8222"
-    # Упрощенный healthcheck
     healthcheck:
       test: ["CMD-SHELL", "timeout 1 nc -z localhost 4222 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  worker:
+  redis:  
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    environment:
+      - REDIS_PASSWORD=secure_redis_password_123
+    volumes:
+      - redis_data:/data
+    command: redis-server --requirepass secure_redis_password_123 --appendonly yes  
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "secure_redis_password_123", "ping"]  
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  worker: 
     build: .
     environment:
       - DATABASE_URL=postgresql://event_user:secure_password_123@db:5432/events_db
       - NATS_URL=nats://nats:4222
+      - REDIS_URL=redis://:secure_redis_password_123@redis:6379  
     depends_on:
       - db
       - nats
+      - redis 
     volumes:
       - ./logs:/app/logs
-    # Воркер сам обрабатывает реконнекты
     command: "python -m app.worker"
 
 volumes:
   postgres_data:
+  redis_data:

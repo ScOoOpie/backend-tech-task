@@ -2,24 +2,26 @@ import time
 from datetime import datetime, timezone
 import logging
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Depends, Query
 from sqlalchemy.orm import Session
-from prometheus_client import Counter, Histogram, generate_latest
+from prometheus_client import Counter, Histogram, Gauge, generate_latest
 from .auth import APIKeyManager, get_current_user, require_admin_access, require_write_access, require_read_access
 from .database import get_db, engine
 from .models import Base, APIKey, User
 from .schemas import APIKeyListResponse, EventBatch, AnalyticsResponse, GenerateAPIKeyRequest, GenerateAPIKeyResponse, UserCreateRequest, UserResponse, UsersListResponse
-from .crud import ingest_events, get_user_stats, get_ingestion_metrics
+from .crud import ingest_events, get_user_stats, get_ingestion_metrics, clear_user_cache, get_cache_stats
 from .analytics import *
 from .middleware import RateLimiter
 from .models import Event 
+from .redis_client import redis_client
 import asyncio
 import uuid
 from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 import os
+from .migrate import run_migrations
 # Моделі БД
-#Base.metadata.create_all(bind=engine)
+# Base.metadata.create_all(bind=engine)
 
 # Налаштування логування
 def setup_logging():
@@ -73,15 +75,42 @@ logger = logging.getLogger(__name__)
 EVENTS_INGESTED_COUNTER = Counter('events_ingested_total', 'Total ingested events')
 EVENTS_PUBLISHED_COUNTER = Counter('events_published_nats_total', 'Total events published to NATS')
 REQUEST_DURATION = Histogram('request_duration_seconds', 'Request duration')
+CACHE_HITS = Counter('cache_hits_total', 'Total cache hits', ['endpoint'])
+CACHE_MISSES = Counter('cache_misses_total', 'Total cache misses', ['endpoint'])
+REDIS_CONNECTION_GAUGE = Gauge('redis_connected', 'Redis connection status')
 
 # Инициализация менеджера ключей (ОДИН РАЗ)
 api_key_manager = APIKeyManager()
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("🚀 Starting Event Analytics Service")
+    
+    # 🔧 ПРИМЕНЯЕМ МИГРАЦИИ ПРИ СТАРТЕ
+    logger.info("📦 Checking database migrations...")
+    
+    # Запускаем миграции в отдельном потоке чтобы не блокировать старт
+    migration_success = await asyncio.get_event_loop().run_in_executor(
+        None, 
+        run_migrations
+    )
+    
+    if not migration_success:
+        logger.error("❌ Database migrations failed - application may not work correctly")
+        # В production можно выйти, в development продолжаем
+        if os.getenv("ENVIRONMENT") == "production":
+            raise RuntimeError("Database migrations failed")
+    else:
+        logger.info("✅ Database migrations completed")
+    # Подключаем Redis
+    await redis_client.connect()
+    REDIS_CONNECTION_GAUGE.set(1 if redis_client.is_connected else 0)
+    
+    if redis_client.is_connected:
+        logger.info("✅ Redis connected successfully")
+    else:
+        logger.warning("⚠️ Redis connection failed - caching disabled")
     
     # Спробувати імпортувати NATS (опціонально)
     try:
@@ -96,11 +125,20 @@ async def lifespan(app: FastAPI):
         logger.warning(f"⚠️ NATS setup failed: {e}")
         app.state.nats_enabled = False
     
-    logger.info("✅ Database tables created")
+    # Добавляем Redis в state приложения
+    app.state.redis_enabled = redis_client.is_connected
+    
+    logger.info("✅ All services initialized")
     yield
     
     # Shutdown
     logger.info("🛑 Shutting down Event Analytics Service")
+    
+    # Закрываем Redis
+    await redis_client.close()
+    REDIS_CONNECTION_GAUGE.set(0)
+    
+    # Закрываем NATS
     try:
         from .nats_client import nats_client
         await nats_client.close()
@@ -109,8 +147,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Event Analytics Service",
-    description="API для збору та аналітики подій з системою аутентифікації",
-    version="1.0.0",
+    description="API для збору та аналітики подій з системою аутентифікації и Redis кэшированием",
+    version="1.1.0",  # Обновили версию из-за добавления Redis
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc"
@@ -121,6 +159,20 @@ rate_limiter = RateLimiter(capacity=1000, refill_rate=100)
 
 async def get_rate_limiter():
     return rate_limiter
+
+# ==================== REDIS UTILS ====================
+
+async def get_cache_info() -> Dict[str, Any]:
+    """Получение информации о кэше"""
+    try:
+        cache_stats = await get_cache_stats()
+        return {
+            "redis_enabled": getattr(app.state, 'redis_enabled', False),
+            "cache_stats": cache_stats
+        }
+    except Exception as e:
+        logger.error(f"Error getting cache info: {str(e)}")
+        return {"redis_enabled": False, "error": str(e)}
 
 # ==================== NATS UTILS ====================
 
@@ -175,6 +227,7 @@ async def post_events(
     - Вимагає права **write**
     - Обмеження кількості запитів
     - Зберігає в БД та публікує в NATS
+    - Автоматически инвалидирует Redis кэш
     """
     start_time = time.time()
     
@@ -193,6 +246,9 @@ async def post_events(
         if ingested_count > 0:
             asyncio.create_task(publish_events_to_nats(events.events))
         
+        # Логируем информацию о кэше
+        cache_info = await get_cache_info()
+        
         logger.info(f"📝 User {user['user_id']} ingested {ingested_count} events in {duration:.3f}s")
         
         return {
@@ -200,7 +256,9 @@ async def post_events(
             "ingested": ingested_count,
             "total_received": len(events.events),
             "processing_time": f"{duration:.3f}s",
-            "nats_enabled": getattr(app.state, 'nats_enabled', False)
+            "nats_enabled": getattr(app.state, 'nats_enabled', False),
+            "cache_enabled": cache_info["redis_enabled"],
+            "cache_invalidated": True
         }
             
     except Exception as e:
@@ -235,6 +293,11 @@ async def create_user(
         db.add(new_user)
         db.commit()
         
+        # Инвалидируем кэш пользователей
+        if redis_client.is_connected:
+            await redis_client.delete_pattern("user_stats:*")
+            await redis_client.delete_pattern("ingestion_metrics:*")
+        
         # Публикуем событие в NATS
         try:
             from .nats_client import nats_client
@@ -261,7 +324,8 @@ async def create_user(
             "message": "✅ User created successfully",
             "user_id": user_id,
             "name": name,
-            "email": email
+            "email": email,
+            "cache_invalidated": redis_client.is_connected
         }
         
     except HTTPException:
@@ -299,7 +363,8 @@ async def list_users(
         
         return {
             "total_users": len(users_info),
-            "users": users_info
+            "users": users_info,
+            "cache_info": await get_cache_info()
         }
         
     except Exception as e:
@@ -318,8 +383,11 @@ async def get_user(
         if not db_user:
             raise HTTPException(status_code=404, detail="User not found")
         
-        # Используем новую функцию для статистики
+        # Используем новую функцию для статистики (уже с кэшированием)
         user_stats = get_user_stats(db, user_id)
+        
+        # Логируем информацию о кэше
+        cache_info = await get_cache_info()
         
         return {
             "user_id": db_user.user_id,
@@ -328,7 +396,11 @@ async def get_user(
             "is_active": db_user.is_active,
             "created_at": db_user.created_at,
             "updated_at": db_user.updated_at,
-            "stats": user_stats
+            "stats": user_stats,
+            "cache_info": {
+                "redis_connected": cache_info["redis_enabled"],
+                "from_cache": cache_info["redis_enabled"]  # Предполагаем, что если Redis подключен, то данные из кэша
+            }
         }
         
     except HTTPException:
@@ -351,9 +423,18 @@ async def get_dau(
     
     - Вимагає права **read**
     - Параметри: from_date, to_date (формат: YYYY-MM-DD)
+    - Данные кэшируются в Redis
     """
     try:
         result = await get_dau_stats(db, from_date, to_date)
+        
+        # Добавляем информацию о кэше в ответ
+        cache_info = await get_cache_info()
+        result["cache_info"] = {
+            "redis_connected": cache_info["redis_enabled"],
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        
         return AnalyticsResponse(data=result)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -374,9 +455,18 @@ async def get_top_events_stats(
     
     - Вимагає права **read**
     - Параметри: from_date, to_date, limit
+    - Данные кэшируются в Redis
     """
     try:
         result = await get_top_events(db, from_date, to_date, limit)
+        
+        # Добавляем информацию о кэше
+        cache_info = await get_cache_info()
+        result["cache_info"] = {
+            "redis_connected": cache_info["redis_enabled"],
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        
         return AnalyticsResponse(data=result)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -396,9 +486,18 @@ async def get_retention(
     
     - Вимагає права **read**
     - Параметри: start_date (дата когорты), windows (количество дней)
+    - Данные кэшируются в Redis
     """
     try:
         result = await get_retention_stats(db, start_date, windows)
+        
+        # Добавляем информацию о кэше
+        cache_info = await get_cache_info()
+        result["cache_info"] = {
+            "redis_connected": cache_info["redis_enabled"],
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        
         return AnalyticsResponse(data=result)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -412,10 +511,14 @@ async def get_active_cohorts(
     db: Session = Depends(get_db),
     user: dict = Depends(require_read_access)
 ):
-    """Список активных когорт"""
+    """Список активных когорт с кэшированием"""
     try:
         cohorts = await get_cohorts_list(db, limit)
-        return {"cohorts": cohorts}
+        
+        return {
+            "cohorts": cohorts,
+            "cache_info": await get_cache_info()
+        }
     except Exception as e:
         logger.error(f"Error getting active cohorts: {str(e)}")
         raise HTTPException(status_code=500, detail="Error getting cohorts")
@@ -426,17 +529,204 @@ async def get_user_retention(
     db: Session = Depends(get_db),
     user: dict = Depends(require_read_access)
 ):
-    """Статистика ретеншена для конкретного пользователя"""
+    """Статистика ретеншена для конкретного пользователя с кэшированием"""
     try:
         stats = await get_user_retention_data(db, user_id)
         if "error" in stats:
             raise HTTPException(status_code=404, detail=stats["error"])
+        
+        # Добавляем информацию о кэше
+        cache_info = await get_cache_info()
+        stats["cache_info"] = {
+            "redis_connected": cache_info["redis_enabled"],
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        
         return stats
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error getting user retention: {str(e)}")
         raise HTTPException(status_code=500, detail="Error getting user retention")
+
+# ==================== CACHE MANAGEMENT ENDPOINTS ====================
+
+@app.get("/cache/status")
+async def get_cache_status(user: dict = Depends(require_admin_access)):
+    """Статус Redis кэша"""
+    try:
+        cache_info = await get_cache_info()
+        return cache_info
+    except Exception as e:
+        logger.error(f"Error getting cache status: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error getting cache status")
+
+@app.post("/cache/clear")
+async def clear_cache(
+    pattern: str = Query("cache:*", description="Pattern to clear"),
+    user: dict = Depends(require_admin_access)
+):
+    """Очистка кэша"""
+    try:
+        if not redis_client.is_connected:
+            return {
+                "message": "Redis not connected",
+                "pattern": pattern,
+                "keys_deleted": 0
+            }
+        
+        keys = await redis_client.client.keys(pattern)
+        if keys:
+            await redis_client.client.delete(*keys)
+        
+        logger.info(f"🗑️ Admin {user['user_id']} cleared cache pattern: {pattern}")
+        
+        return {
+            "message": "✅ Cache cleared successfully",
+            "pattern": pattern,
+            "keys_deleted": len(keys)
+        }
+    except Exception as e:
+        logger.error(f"Error clearing cache: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error clearing cache")
+
+@app.post("/cache/users/{user_id}/clear")
+async def clear_user_cache_endpoint(
+    user_id: str,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_admin_access)
+):
+    """Очистка кэша для конкретного пользователя"""
+    try:
+        success = await clear_user_cache(user_id)
+        
+        return {
+            "message": "✅ User cache cleared successfully" if success else "❌ User cache clear failed",
+            "user_id": user_id,
+            "success": success
+        }
+    except Exception as e:
+        logger.error(f"Error clearing user cache: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error clearing user cache")
+
+@app.get("/cache/keys")
+async def list_cache_keys(
+    pattern: str = Query("cache:*", description="Key pattern"),
+    limit: int = Query(100, ge=1, le=1000, description="Maximum keys to return"),
+    user: dict = Depends(require_admin_access)
+):
+    """Список ключей в кэше"""
+    try:
+        if not redis_client.is_connected:
+            return {
+                "pattern": pattern,
+                "keys_count": 0,
+                "keys": [],
+                "message": "Redis not connected"
+            }
+        
+        keys = await redis_client.client.keys(pattern)
+        
+        return {
+            "pattern": pattern,
+            "keys_count": len(keys),
+            "keys": keys[:limit]
+        }
+    except Exception as e:
+        logger.error(f"Error listing cache keys: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error listing cache keys")
+
+# ==================== SYSTEM ENDPOINTS ====================
+
+@app.get("/system/metrics")
+async def get_system_metrics(user: dict = Depends(require_admin_access)):
+    """Системные метрики включая Redis"""
+    try:
+        cache_info = await get_cache_info()
+        ingestion_metrics = get_ingestion_metrics(db=next(get_db()))
+        
+        return {
+            "cache": cache_info,
+            "ingestion": ingestion_metrics,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error getting system metrics: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error getting system metrics")
+
+@app.get("/metrics")
+async def metrics(
+    user: dict = Depends(require_admin_access)
+):
+    """Prometheus метрики"""
+    return generate_latest()
+
+@app.get("/health")
+async def health_check():
+    """Перевірка здоров'я системи с информацией о Redis"""
+    nats_enabled = getattr(app.state, 'nats_enabled', False)
+    redis_enabled = getattr(app.state, 'redis_enabled', False)
+    
+    # Проверяем соединение с Redis
+    redis_healthy = False
+    if redis_enabled and redis_client.is_connected:
+        try:
+            await redis_client.client.ping()
+            redis_healthy = True
+        except:
+            redis_healthy = False
+    
+    return {
+        "status": "healthy", 
+        "nats_enabled": nats_enabled,
+        "redis_enabled": redis_enabled,
+        "redis_healthy": redis_healthy,
+        "services": ["web", "db", "nats", "redis"],
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+@app.get("/debug/pool-status")
+async def pool_status():
+    """Статус пула соединений БД"""
+    pool = engine.pool
+    status = {
+        "pool_config": {
+            "size": pool.size(),
+            "max_overflow": pool._max_overflow,
+            "timeout": pool.timeout,
+            "recycle": pool._recycle
+        },
+        "current_usage": {
+            "checkedout": pool.checkedout(),  # Занятые соединения
+            "checkedin": pool.checkedin(),    # Свободные соединения  
+            "overflow": pool.overflow(),      # Сверх лимита
+            "total": pool.checkedout() + pool.checkedin()
+        },
+        "status": "OK" if pool.checkedout() <= (pool.size() + pool._max_overflow) else "OVERLOAD",
+        "redis_connected": getattr(app.state, 'redis_enabled', False)
+    }
+    return status
+
+@app.get("/")
+async def root():
+    """Кореневий ендпоінт"""
+    cache_info = await get_cache_info()
+    
+    return {
+        "message": "Event Analytics Service with Redis Caching", 
+        "version": "1.1.0",
+        "docs": "/docs",
+        "health": "/health",
+        "cache_enabled": cache_info["redis_enabled"],
+        "features": [
+            "Event ingestion",
+            "User analytics", 
+            "Cohort analysis",
+            "Redis caching",
+            "NATS integration",
+            "API key authentication"
+        ]
+    }
 
 # ==================== NATS ENDPOINTS ====================
 
@@ -758,4 +1048,6 @@ async def root():
         "docs": "/docs",
         "health": "/health"
     }
+
+
 

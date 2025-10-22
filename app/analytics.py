@@ -3,9 +3,19 @@ from sqlalchemy import func, text
 from datetime import datetime, timedelta
 from typing import Dict, Any, List
 import logging
+from .cache import cached, invalidate_cache
+from .redis_client import redis_client
 
+# Ключи для кэширования
+CACHE_KEYS = {
+    "cohorts_list": "cohorts:list:*",
+    "retention_stats": "retention:*", 
+    "dau_stats": "dau:*",
+    "top_events": "top_events:*",
+    "user_retention": "user_retention:*"
+}
 logger = logging.getLogger(__name__)
-
+@cached(ttl=600, key_prefix="cohorts_list")
 async def get_cohorts_list(db: Session, limit: int = 10) -> List[Dict[str, Any]]:
     """Список активных когорт"""
     try:
@@ -58,7 +68,9 @@ async def get_cohorts_list(db: Session, limit: int = 10) -> List[Dict[str, Any]]
     except Exception as e:
         logger.error(f"Error getting cohorts list: {str(e)}", exc_info=True)
         return []
+    
 
+@cached(ttl=1800, key_prefix="retention_stats")
 async def get_retention_stats(db: Session, start_date: str, windows: int = 7) -> Dict[str, Any]:
     """Ретеншен на основе таблицы user_retention"""
     try:
@@ -172,7 +184,7 @@ async def get_retention_stats(db: Session, start_date: str, windows: int = 7) ->
             "error": str(e)
         }
 
-# Остальные функции остаются без изменений
+@cached(ttl=300, key_prefix="dau_stats")
 async def get_dau_stats(db: Session, from_date: str, to_date: str) -> Dict[str, Any]:
     """Кількість унікальних user_id по днях"""
     try:
@@ -196,6 +208,7 @@ async def get_dau_stats(db: Session, from_date: str, to_date: str) -> Dict[str, 
         logger.error(f"Error calculating DAU: {str(e)}")
         raise
 
+@cached(ttl=600, key_prefix="top_events")
 async def get_top_events(db: Session, from_date: str, to_date: str, limit: int = 10) -> Dict[str, Any]:
     """Топ event_type за кількістю"""
     try:
@@ -224,6 +237,8 @@ async def get_top_events(db: Session, from_date: str, to_date: str, limit: int =
         logger.error(f"Error calculating top events: {str(e)}")
         raise
 
+    
+@cached(ttl=900, key_prefix="user_retention")
 async def get_user_retention_data(db: Session, user_id: str) -> Dict[str, Any]:
     """Статистика ретеншена для конкретного пользователя"""
     try:
