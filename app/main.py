@@ -21,21 +21,19 @@ from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 import os
 from .migrate import run_migrations
 # Моделі БД
-Base.metadata.create_all(bind=engine)
+#Base.metadata.create_all(bind=engine)
 
 # Налаштування логування
 def setup_logging():
     """Настройка логгера с ротацией"""
     
-    # Создаем папку для логов
-    log_dir = "logs"
+    # Создаем папку для логов (абсолютный путь)
+    log_dir = "/app/logs"
     os.makedirs(log_dir, exist_ok=True)
     
     # Основной handler с ротацией по размеру
     file_handler = RotatingFileHandler(
         filename=os.path.join(log_dir, 'app.log'),
-        maxBytes=10 * 1024 * 1024,  # 10 MB
-        backupCount=5,  # Хранить 5 backup файлов
         encoding='utf-8'
     )
     
@@ -67,9 +65,7 @@ def setup_logging():
         ]
     )
 
-# Инициализируем логгинг
-setup_logging()
-logger = logging.getLogger(__name__)
+
 
 # Метрики
 EVENTS_INGESTED_COUNTER = Counter('events_ingested_total', 'Total ingested events')
@@ -85,6 +81,10 @@ api_key_manager = APIKeyManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    # 🔧 ПЕРВОЕ ДЕЛО - настраиваем логирование
+    logger = logging.getLogger(__name__)
+    setup_logging()
+    
     logger.info("🚀 Starting Event Analytics Service")
     
     # 🔧 ПРИМЕНЯЕМ МИГРАЦИИ ПРИ СТАРТЕ
@@ -103,6 +103,7 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("Database migrations failed")
     else:
         logger.info("✅ Database migrations completed")
+    
     # Подключаем Redis
     await redis_client.connect()
     REDIS_CONNECTION_GAUGE.set(1 if redis_client.is_connected else 0)

@@ -13,11 +13,6 @@ app_dir = os.path.join(project_root, 'app')
 sys.path.insert(0, project_root)
 sys.path.insert(0, app_dir)
 
-print("=" * 50)
-print("🔧 ALEMBIC STARTUP")
-print(f"Project root: {project_root}")
-print(f"App dir: {app_dir}")
-print("=" * 50)
 
 config = context.config 
 
@@ -31,10 +26,7 @@ target_metadata = None
 try:
     from app.models import Base
     target_metadata = Base.metadata
-    print("✅ SUCCESS: Imported via 'from app.models import Base'")
-    print(f"📊 Tables found: {list(target_metadata.tables.keys())}")
 except ImportError as e:
-    print(f"❌ FAILED 'from app.models import Base': {e}")
     target_metadata = MetaData()
 
 if config.config_file_name is not None:
@@ -56,7 +48,6 @@ def run_migrations_offline() -> None:
 
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode."""
-    # 👇 ТУТ config ДОСТУПЕН!
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",

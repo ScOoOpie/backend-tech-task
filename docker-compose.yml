@@ -65,7 +65,7 @@ services:
     environment:
       - DATABASE_URL=postgresql://event_user:secure_password_123@db:5432/events_db
       - NATS_URL=nats://nats:4222
-      - REDIS_URL=redis://:secure_redis_password_123@redis:6379  
+      - REDIS_URL=redis://:secure_redis_password_123@redis:6379
     depends_on:
       - db
       - nats
