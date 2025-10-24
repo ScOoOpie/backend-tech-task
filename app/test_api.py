@@ -149,7 +149,7 @@ class LoadTester:
 async def main():
     # Настройки теста
     BASE_URL = "http://localhost:8000"
-    API_KEY = "M6eyywP3G4ahqRsOlj0oF3bv2t39hh9OABzpa0GXiyM"  # Замените на ваш ключ
+    API_KEY = "iy-Hf249q3BDWzi8XYJkmvXe1HsAeyRtYh9cGAaZ6ro"  # Замените на ваш ключ
     
     # Варианты нагрузки (можно менять)
     test_scenarios = [
