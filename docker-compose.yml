@@ -17,7 +17,7 @@ services:
       - ./logs:/app/logs
     command: "uvicorn app.main:app --host ${APP_HOST} --port ${APP_PORT}"
     env_file:
-      - .env
+      - .env  
 
   db:
     image: postgres:13
