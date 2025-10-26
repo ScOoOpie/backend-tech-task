@@ -20,9 +20,23 @@ class Event(Base):
     user_id = Column(String(255), nullable=False, index=True)
     event_type = Column(String(255), nullable=False, index=True)
     properties = Column(JSONB)
+    event_date = Column(Date, index=True)
     
     # Денормалізовані поля для швидкої аналітики
     event_date = Column(Date, index=True)
+    def __repr__(self):
+        return f"<Event(id={self.id}, type='{self.event_type}', user='{self.user_id}')>"
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'event_id': str(self.event_id),
+            'occurred_at': self.occurred_at.isoformat(),
+            'user_id': self.user_id,
+            'event_type': self.event_type,
+            'properties': self.properties,
+            'event_date': self.event_date.isoformat() if self.event_date else None
+        }
 
 class UserRetention(Base):
     __tablename__ = "user_retention"
